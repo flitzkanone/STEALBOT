@@ -1,7 +1,7 @@
 import logging
 import os
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- KONFIGURATION WIRD AUS UMGEBUNGSVARIABLEN GELESEN ---
 
@@ -9,17 +9,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TRIGGER_WOERTER_STR = os.environ.get("TRIGGER_WOERTER", "")
 TRIGGER_WOERTER = [word.strip().lower() for word in TRIGGER_WOERTER_STR.split(',') if word.strip()]
 
-ZIEL_GRUPPEN_IDS_STR = os.environ.get("ZIEL_GRUPPEN_IDS", "")
-ZIEL_GRUPPEN_IDS = []
-if ZIEL_GRUPPEN_IDS_STR:
-    try:
-        ZIEL_GRUPPEN_IDS = [int(gid.strip()) for gid in ZIEL_GRUPPEN_IDS_STR.split(',') if gid.strip()]
-    except ValueError:
-        logging.critical("FEHLER: ZIEL_GRUPPEN_IDS enthält ungültige Zeichen.")
-        exit()
+# NEU: Einzelne Ziel-Benutzer-ID einlesen
+ZIEL_BENUTZER_ID = None
+try:
+    ZIEL_BENUTZER_ID = int(os.environ.get("ZIEL_BENUTZER_ID"))
+except (ValueError, TypeError):
+    logging.warning("ZIEL_BENUTZER_ID ist nicht oder falsch gesetzt. Keyword-Weiterleitung ist deaktiviert.")
 
-if not BOT_TOKEN or not TRIGGER_WOERTER or not ZIEL_GRUPPEN_IDS:
-    logging.critical("FEHLER: Eine der Umgebungsvariablen (BOT_TOKEN, TRIGGER_WOERTER, ZIEL_GRUPPEN_IDS) fehlt. Der Bot kann nicht starten.")
+# Überprüfung, ob die Basis-Variablen gesetzt sind
+if not BOT_TOKEN or not TRIGGER_WOERTER:
+    logging.critical("FEHLER: BOT_TOKEN oder TRIGGER_WOERTER fehlt. Der Bot kann nicht starten.")
     exit()
 
 # Logging einrichten
@@ -28,7 +27,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# NEU: /start-Befehl, um die Chat-ID herauszufinden
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat_id = user.id
+    await update.message.reply_html(
+        f"Hallo {user.mention_html()}!\n\n"
+        f"Ich bin der Keyword-Bot. Deine persönliche Chat-ID lautet:\n"
+        f"<code>{chat_id}</code>\n\n"
+        f"Bitte gib diese ID im Render-Dashboard bei der Variable `ZIEL_BENUTZER_ID` an."
+    )
+
+# Diese Funktion verarbeitet Nachrichten aus den Gruppen
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Funktion wird nur ausgeführt, wenn eine Ziel-ID konfiguriert ist
+    if not ZIEL_BENUTZER_ID:
+        return
+
     if not update.message or not update.message.text:
         return
 
@@ -36,32 +52,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = message.chat
     text_lower = message.text.lower()
 
-    # Überprüfe, ob eines der Trigger-Wörter in der Nachricht vorkommt
     for wort in TRIGGER_WOERTER:
         if wort in text_lower:
-            logger.info(f"Schlüsselwort '{wort}' in Gruppe '{chat.title}' gefunden. Leite Nachricht an {len(ZIEL_GRUPPEN_IDS)} Gruppen weiter...")
-            
-            # Schleife durch alle Ziel-Gruppen
-            for gruppen_id in ZIEL_GRUPPEN_IDS:
-                try:
-                    # HIER IST DIE ÄNDERUNG: Nur noch die Originalnachricht weiterleiten
-                    await context.bot.forward_message(
-                        chat_id=gruppen_id,
-                        from_chat_id=message.chat_id,
-                        message_id=message.message_id
-                    )
-                    logger.info(f"-> Erfolgreich an Ziel-Gruppe {gruppen_id} weitergeleitet.")
-                except Exception as e:
-                    # Loggt einen Fehler, falls das Weiterleiten an eine spezifische Gruppe fehlschlägt
-                    logger.error(f"Fehler beim Weiterleiten an Gruppe {gruppen_id}: {e}")
-            
-            # Beende die Keyword-Suche nach dem ersten Treffer, um Doppel-Weiterleitungen zu vermeiden
-            break
+            try:
+                # Info-Text erstellen, damit Anna weiß, woher die Nachricht kommt
+                info_text = (
+                    f"🔑 Schlüsselwort '{wort}' gefunden!\n\n"
+                    f"👥 **Aus Gruppe:** {chat.title or 'Unbekannt'}"
+                )
+                
+                # Zuerst den Info-Text an Anna senden
+                await context.bot.send_message(chat_id=ZIEL_BENUTZER_ID, text=info_text, parse_mode='Markdown')
+                
+                # Dann die Originalnachricht an Anna weiterleiten
+                await context.bot.forward_message(
+                    chat_id=ZIEL_BENUTZER_ID,
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id
+                )
+                
+                logger.info(f"Nachricht aus Gruppe '{chat.title}' an Benutzer {ZIEL_BENUTZER_ID} weitergeleitet.")
+                break
+                
+            except Exception as e:
+                logger.error(f"Fehler beim Weiterleiten an Benutzer {ZIEL_BENUTZER_ID}: {e}")
 
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # NEU: Den /start-Befehl registrieren
+    application.add_handler(CommandHandler("start", start))
+
+    # Handler für Nachrichten in Gruppen
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info(f"Bot startet... Überwacht auf {len(TRIGGER_WOERTER)} Keywords. Leitet an {len(ZIEL_GRUPPEN_IDS)} Gruppen weiter.")
+
+    log_message = f"Bot startet... Überwacht auf {len(TRIGGER_WOERTER)} Keywords."
+    if ZIEL_BENUTZER_ID:
+        log_message += f" Leitet an Benutzer-ID {ZIEL_BENUTZER_ID} weiter."
+    logger.info(log_message)
+    
     application.run_polling()
 
 if __name__ == "__main__":
