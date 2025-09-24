@@ -1,0 +1,18 @@
+# Python Bytecode und Caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtuelle Umgebungen
+venv/
+.venv/
+env/
+.env
+
+# Editor-spezifische Dateien
+.vscode/
+.idea/
+
+# Lokale Konfigurationsdateien (wichtig!)
+*.env
