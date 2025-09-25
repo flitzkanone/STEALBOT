@@ -2,10 +2,10 @@ import logging
 import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from threading import Thread # NEU: Importieren von Thread
-from flask import Flask     # NEU: Importieren von Flask
+from threading import Thread # Nötig für den parallelen Webserver
+from flask import Flask     # Der Webserver selbst
 
-# --- Logging und Konfiguration wie gehabt ---
+# --- Logging und Konfiguration ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -20,36 +20,30 @@ try:
 except (ValueError, TypeError):
     logging.warning("ZIEL_BENUTZER_ID ist nicht oder falsch gesetzt. Keyword-Weiterleitung ist deaktiviert.")
 
-if not BOT_TOKEN or not TRIGGER_WOERTER:
-    logging.critical("FEHLER: BOT_TOKEN oder TRIGGER_WOERTER fehlt. Der Bot kann nicht starten.")
+if not BOT_TOKEN:
+    logging.critical("FEHLER: BOT_TOKEN fehlt. Der Bot kann nicht starten.")
     exit()
 
 
-# --- NEU: Der kleine Flask-Webserver ---
+# --- Der kleine Flask-Webserver, um Render zufrieden zu stellen ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    # Diese Nachricht sieht niemand, sie ist nur da, damit der Server etwas tut.
-    return "Bot is alive and listening."
+    return "Bot is alive."
 
 def run_flask():
-    # Render stellt den Port in der PORT-Umgebungsvariable bereit.
-    # Wir benutzen '0.0.0.0', damit der Server von außerhalb des Containers erreichbar ist.
+    # Render gibt den Port in der 'PORT' Umgebungsvariable vor.
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
-# --- Ende des neuen Webserver-Teils ---
 
 
-# --- Deine Bot-Funktionen bleiben unverändert ---
+# --- Bot-Funktionen (unverändert) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat_id = user.id
     await update.message.reply_html(
-        f"Hallo {user.mention_html()}!\n\n"
-        f"Deine persönliche Chat-ID lautet:\n"
-        f"<code>{chat_id}</code>\n\n"
-        f"Trage diese ID in Render als `ZIEL_BENUTZER_ID` ein."
+        f"Hallo {user.mention_html()}! Deine Chat-ID ist: <code>{chat_id}</code>"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -66,18 +60,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 info_text = f"🔑 Schlüsselwort '{wort}' gefunden!\n\n👥 **Aus Gruppe:** {chat.title or 'Unbekannt'}"
                 await context.bot.send_message(chat_id=ZIEL_BENUTZER_ID, text=info_text, parse_mode='Markdown')
                 await context.bot.forward_message(chat_id=ZIEL_BENUTZER_ID, from_chat_id=message.chat_id, message_id=message.message_id)
-                logger.info(f"Nachricht aus Gruppe '{chat.title}' an Benutzer {ZIEL_BENUTZER_ID} weitergeleitet.")
+                logger.info(f"Nachricht aus '{chat.title}' an {ZIEL_BENUTZER_ID} weitergeleitet.")
                 break
             except Exception as e:
-                logger.error(f"Fehler beim Weiterleiten an Benutzer {ZIEL_BENUTZER_ID}: {e}")
+                logger.error(f"Fehler beim Weiterleiten: {e}")
 
 
 def main() -> None:
-    # NEU: Starte den Flask-Server in einem eigenen Thread
+    # Starte den Webserver in einem separaten, parallelen Prozess
     flask_thread = Thread(target=run_flask)
     flask_thread.start()
 
-    # Dein Bot startet wie gewohnt
+    # Starte den Telegram Bot
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
