@@ -1,4 +1,3 @@
-# bot.py
 import logging
 import os
 import json
@@ -11,49 +10,51 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import BadRequest
 
-# --- Konfiguration ---
+# --- 1. Stabile Konfiguration ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-TRIGGER_WOERTER_STR = os.environ.get("TRIGGER_WOERTER", "")
-TRIGGER_WOERTER = [word.strip().lower() for word in TRIGGER_WOERTER_STR.split(',') if word.strip()]
 try:
-    ZIEL_BENUTZER_ID = int(os.environ.get("ZIEL_BENUTZER_ID"))
-    DATA_CHANNEL_ID = int(os.environ.get("DATA_CHANNEL_ID"))
-except (ValueError, TypeError):
-    ZIEL_BENUTZER_ID = None
-    DATA_CHANNEL_ID = None
+    BOT_TOKEN = os.environ["BOT_TOKEN"]
+    ZIEL_BENUTZER_ID = int(os.environ["ZIEL_BENUTZER_ID"])
+    DATA_CHANNEL_ID = int(os.environ["DATA_CHANNEL_ID"])
+    TRIGGER_WOERTER_STR = os.environ.get("TRIGGER_WOERTER", "")
+    TRIGGER_WOERTER = [word.strip().lower() for word in TRIGGER_WOERTER_STR.split(',') if word.strip()]
+except (KeyError, ValueError) as e:
+    logger.critical(f"FATALER FEHLER: Umgebungsvariable fehlt/falsch: {e}. Bot stoppt.")
+    exit()
 
+# --- 2. Webserver für Render ---
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot is running."
+def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+# --- 3. Telegram-Nachrichten-Datenbank ---
 db_message_id = None
 PAGE_SIZE = 5
 
-# --- Flask Webserver ---
-app = Flask('')
-@app.route('/')
-def home(): return "Bot is alive."
-def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
-
-# --- Daten-Management via Telegram ---
-# Die Datenstruktur ist jetzt ein Dictionary: {"messages": [], "groups": {}}
 async def init_database(application: Application):
     global db_message_id
-    if not DATA_CHANNEL_ID: return
+    bot = application.bot
     try:
-        chat_info = await application.bot.get_chat(DATA_CHANNEL_ID)
+        chat_info = await bot.get_chat(DATA_CHANNEL_ID)
         if chat_info.pinned_message:
             db_message_id = chat_info.pinned_message.message_id
+            # Überprüfe, ob die Struktur der DB korrekt ist
+            try:
+                data = json.loads(chat_info.pinned_message.text)
+                if "messages" not in data or "groups" not in data:
+                    raise ValueError("Incomplete DB structure")
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("DB-Struktur veraltet/korrupt. Setze zurück.")
+                await bot.edit_message_text(chat_id=DATA_CHANNEL_ID, message_id=db_message_id, text=json.dumps({"messages": [], "groups": {}}))
             logger.info(f"Datenbank-Nachricht gefunden: {db_message_id}")
-            # Stelle sicher, dass die DB-Struktur korrekt ist
-            data = await get_data(application.bot)
-            if "messages" not in data or "groups" not in data:
-                logger.warning("DB-Struktur veraltet. Setze zurück.")
-                await save_data(application.bot, {"messages": [], "groups": {}})
         else:
-            logger.warning("Keine DB-Nachricht gefunden. Erstelle neue.")
-            new_db_content = json.dumps({"messages": [], "groups": {}}, indent=2)
-            message = await application.bot.send_message(chat_id=DATA_CHANNEL_ID, text=new_db_content)
-            await application.bot.pin_chat_message(chat_id=DATA_CHANNEL_ID, message_id=message.message_id, disable_notification=True)
+            logger.warning("Keine DB-Nachricht. Erstelle neue.")
+            new_db = json.dumps({"messages": [], "groups": {}})
+            message = await bot.send_message(chat_id=DATA_CHANNEL_ID, text=new_db)
+            await bot.pin_chat_message(chat_id=DATA_CHANNEL_ID, message_id=message.message_id, disable_notification=True)
             db_message_id = message.message_id
     except Exception as e:
         logger.error(f"Fehler bei DB-Initialisierung: {e}")
@@ -63,54 +64,56 @@ async def get_data(bot) -> dict:
     try:
         chat_info = await bot.get_chat(DATA_CHANNEL_ID)
         return json.loads(chat_info.pinned_message.text)
-    except Exception:
-        return {"messages": [], "groups": {}}
+    except Exception: return {"messages": [], "groups": {}}
 
 async def save_data(bot, data: dict):
     if not db_message_id: return
     try:
-        # Sortiere Nachrichten, beschränke auf die neuesten 200
         data["messages"].sort(key=lambda x: x['timestamp'], reverse=True)
         data["messages"] = data["messages"][:200]
-        json_string = json.dumps(data, indent=2)
-        await bot.edit_message_text(chat_id=DATA_CHANNEL_ID, message_id=db_message_id, text=json_string)
+        await bot.edit_message_text(chat_id=DATA_CHANNEL_ID, message_id=db_message_id, text=json.dumps(data, indent=2))
     except BadRequest as e:
-        if "message is not modified" not in str(e):
-            logger.error(f"Fehler beim Speichern: {e}")
+        if "message is not modified" not in str(e): logger.error(f"Fehler beim Speichern: {e}")
+    except Exception as e: logger.error(f"Allg. Fehler beim Speichern: {e}")
 
-# --- Hauptlogik ---
+# --- 4. Bot-Handler und Funktionen ---
+
+# /start öffnet jetzt das Menü
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Der neue /start Befehl, der das Menü öffnet und den Chat aufräumt."""
-    # Chat aufräumen: Löscht die /start Nachricht
-    try:
-        await update.message.delete()
-    except Exception:
-        pass # Ignoriere, wenn das Löschen fehlschlägt
-
+    try: await update.message.delete()
+    except: pass
+    
     data = await get_data(context.bot)
     known_groups = data.get("groups", {})
     
     keyboard = [
-        [InlineKeyboardButton("Alle gespeicherten Nachrichten", callback_data='view_all_0')],
-        [InlineKeyboardButton("Nur Gutschein-Codes", callback_data='view_codes_0')],
+        [InlineKeyboardButton("Gespeicherte Nachrichten", callback_data='view_all_0')],
+        [InlineKeyboardButton("Gutschein-Codes", callback_data='view_codes_0')],
     ]
-    
     if known_groups:
-        keyboard.append([InlineKeyboardButton("--- Live-Überwachung starten ---", callback_data='noop')])
+        keyboard.append([InlineKeyboardButton("--- Live-Überwachung ---", callback_data='noop')])
         for group_id, group_name in known_groups.items():
             keyboard.append([InlineKeyboardButton(f"➡️ {group_name}", callback_data=f'monitor_start_{group_id}')])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    menu_message = await update.effective_chat.send_text('Hauptmenü:', reply_markup=reply_markup)
-    
-    # Speichere die ID der Menü-Nachricht, um sie später zu löschen
+    menu_message = await update.effective_chat.send_text('Hauptmenü:', reply_markup=InlineKeyboardMarkup(keyboard))
     context.user_data['menu_message_id'] = menu_message.message_id
 
-async def handle_keyword_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Speichert Nachrichten mit Keywords im Hintergrund."""
-    if not (ZIEL_BENUTZER_ID and DATA_CHANNEL_ID): return
+# Handler für alle Nachrichten in Gruppen
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
-    
+
+    # A) Live-Monitoring-Logik
+    monitoring_chat_id = context.user_data.get('monitoring_chat_id')
+    if monitoring_chat_id and str(update.message.chat_id) == monitoring_chat_id:
+        try:
+            timestamp = update.message.date.strftime('%H:%M:%S')
+            info_msg = await context.bot.send_message(ZIEL_BENUTZER_ID, f"_{timestamp}_", parse_mode='Markdown')
+            fwd_msg = await context.bot.forward_message(ZIEL_BENUTZER_ID, update.message.chat_id, update.message.message_id)
+            if 'forwarded_messages' not in context.user_data: context.user_data['forwarded_messages'] = []
+            context.user_data['forwarded_messages'].extend([info_msg.message_id, fwd_msg.message_id])
+        except Exception as e: logger.error(f"Fehler im Live-Monitoring: {e}")
+
+    # B) Keyword-Speicher-Logik (läuft immer im Hintergrund)
     if any(wort in update.message.text.lower() for wort in TRIGGER_WOERTER):
         try:
             data = await get_data(context.bot)
@@ -124,152 +127,99 @@ async def handle_keyword_message(update: Update, context: ContextTypes.DEFAULT_T
             data["messages"].insert(0, new_entry)
             await save_data(context.bot, data)
             logger.info(f"Keyword-Nachricht aus '{update.message.chat.title}' gespeichert.")
-        except Exception as e:
-            logger.error(f"Fehler in handle_keyword_message: {e}")
+        except Exception as e: logger.error(f"Fehler beim Speichern der Keyword-Nachricht: {e}")
 
-async def handle_monitoring_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Leitet ALLE Nachrichten weiter, wenn der Live-Modus für diesen Chat aktiv ist."""
-    monitoring_chat_id = context.user_data.get('monitoring_chat_id')
-    if monitoring_chat_id and str(update.message.chat_id) == monitoring_chat_id:
-        try:
-            # Füge einen Zeitstempel hinzu
-            timestamp = update.message.date.strftime('%H:%M:%S')
-            info_msg = await context.bot.send_message(
-                chat_id=ZIEL_BENUTZER_ID,
-                text=f"_{timestamp}_",
-                parse_mode='Markdown'
-            )
-            
-            fwd_msg = await context.bot.forward_message(
-                chat_id=ZIEL_BENUTZER_ID,
-                from_chat_id=update.message.chat_id,
-                message_id=update.message.message_id
-            )
-            # Speichere die IDs der weitergeleiteten Nachrichten zum späteren Löschen
-            if 'forwarded_messages' not in context.user_data:
-                context.user_data['forwarded_messages'] = []
-            context.user_data['forwarded_messages'].extend([info_msg.message_id, fwd_msg.message_id])
-        except Exception as e:
-            logger.error(f"Fehler im Live-Monitoring: {e}")
-
-async def handle_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lernt neue Gruppen, wenn der Bot hinzugefügt wird."""
+# Bot lernt neue Gruppen
+async def new_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.bot.id in [m.id for m in update.message.new_chat_members]:
         chat = update.message.chat
-        logger.info(f"Bot wurde zur Gruppe '{chat.title}' ({chat.id}) hinzugefügt.")
         data = await get_data(context.bot)
+        if "groups" not in data: data["groups"] = {}
         data["groups"][str(chat.id)] = chat.title
         await save_data(context.bot, data)
-        await context.bot.send_message(ZIEL_BENUTZER_ID, f"Ich wurde zur Gruppe '{chat.title}' hinzugefügt und kann sie jetzt überwachen.")
+        await context.bot.send_message(ZIEL_BENUTZER_ID, f"Ich wurde zur Gruppe '{chat.title}' hinzugefügt.")
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verarbeitet alle Knopf-Klicks."""
+# Logik für alle Knopf-Klicks
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # Menü-Nachricht löschen, um den Chat sauber zu halten
-    menu_message_id = context.user_data.get('menu_message_id')
-    if menu_message_id:
-        try:
-            await context.bot.delete_message(chat_id=query.effective_chat.id, message_id=menu_message_id)
-        except Exception: pass
-
-    data_parts = query.data.split('_')
-    action = data_parts[0]
+    # Menü aufräumen
+    if 'menu_message_id' in context.user_data:
+        try: await context.bot.delete_message(query.effective_chat.id, context.user_data['menu_message_id'])
+        except: pass
+        del context.user_data['menu_message_id']
     
+    action, _, payload = query.data.partition('_')
+
     if action == "monitor":
-        sub_action = data_parts[1]
+        sub_action, _, chat_id = payload.partition('_')
         if sub_action == "start":
-            chat_id_to_monitor = data_parts[2]
-            context.user_data['monitoring_chat_id'] = chat_id_to_monitor
-            context.user_data['forwarded_messages'] = [] # Reset list for new session
+            context.user_data['monitoring_chat_id'] = chat_id
+            context.user_data['forwarded_messages'] = []
             
             data = await get_data(context.bot)
-            group_name = data.get("groups", {}).get(chat_id_to_monitor, "Unbekannt")
+            group_name = data.get("groups", {}).get(chat_id, "Unbekannt")
 
-            stop_button = InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Überwachung beenden & aufräumen", callback_data='monitor_stop_0')]])
-            control_message = await query.effective_chat.send_text(
-                f"✅ Live-Überwachung für '{group_name}' gestartet.\nAlle neuen Nachrichten werden jetzt hier angezeigt.",
-                reply_markup=stop_button
-            )
-            # Speichere die ID der Kontroll-Nachricht, damit wir sie auch löschen können
-            context.user_data['control_message_id'] = control_message.message_id
-
-        elif sub_action == "stop":
-            # 1. Lösche alle weitergeleiteten Nachrichten
-            forwarded_ids = context.user_data.get('forwarded_messages', [])
-            for msg_id in forwarded_ids:
-                try:
-                    await context.bot.delete_message(chat_id=query.effective_chat.id, message_id=msg_id)
-                except Exception: pass
-            
-            # 2. Lösche die "Überwachung beenden"-Nachricht
-            control_message_id = context.user_data.get('control_message_id')
-            if control_message_id:
-                try:
-                    await context.bot.delete_message(chat_id=query.effective_chat.id, message_id=control_message_id)
-                except Exception: pass
-
-            # 3. Setze den Status zurück
-            context.user_data.clear()
-            await query.effective_chat.send_text("Überwachung beendet und Chat aufgeräumt. Sende /start für ein neues Menü.")
-
-    elif action == "view": # Logik für "Alle Nachrichten" und "Codes"
-        page = int(data_parts[2])
-        all_data = (await get_data(context.bot)).get("messages", [])
+            stop_button = InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Beenden & Aufräumen", callback_data='stop_monitoring_0')]])
+            msg = await query.effective_chat.send_text(f"✅ Live-Überwachung für '{group_name}' gestartet.", reply_markup=stop_button)
+            context.user_data['control_message_id'] = msg.message_id
         
-        sub_action = data_parts[1]
-        if sub_action == "all":
-            items = all_data
-            text = "📜 Alle gespeicherten Nachrichten:\n\n"
-        else: # "codes"
-            items = [item for item in all_data if item.get('gutschein_code')]
-            text = "🎟️ Gespeicherte Gutschein-Codes:\n\n"
+    elif action == "stop": # monitor_stop oder view_stop
+        for key in ['forwarded_messages', 'control_message_id']:
+            if key in context.user_data:
+                msg_ids = context.user_data[key] if isinstance(context.user_data[key], list) else [context.user_data[key]]
+                for msg_id in msg_ids:
+                    try: await context.bot.delete_message(query.effective_chat.id, msg_id)
+                    except: pass
+        context.user_data.clear()
+        await query.effective_chat.send_text("Aktion beendet und Chat aufgeräumt. Sende /start für ein neues Menü.")
 
-        start_index = page * PAGE_SIZE
-        paginated_items = items[start_index : start_index + PAGE_SIZE]
+    elif action == "view":
+        sub_action, _, page_str = payload.partition('_')
+        page = int(page_str)
+        items = (await get_data(context.bot)).get("messages", [])
+        
+        text, item_source = "", items
+        if sub_action == "all": text = "📜 Gespeicherte Nachrichten:\n\n"
+        elif sub_action == "codes": 
+            text = "🎟️ Gespeicherte Gutschein-Codes:\n\n"
+            item_source = [item for item in items if item.get('gutschein_code')]
+
+        paginated_items = item_source[page*PAGE_SIZE : (page+1)*PAGE_SIZE]
         if not paginated_items: text += "Keine Einträge gefunden."
 
         for i, item in enumerate(paginated_items):
             dt = datetime.fromisoformat(item['timestamp']).strftime('%d.%m %H:%M')
-            if sub_action == "all":
-                text += f"*{start_index+i+1}.* Aus *{item['chat_title']}* ({dt})\n`{item['message_text'][:100]}...`\n\n"
-            else:
-                text += f"*{start_index+i+1}.* Code: `{item['gutschein_code']}`\n_Aus {item['chat_title']} ({dt})_\n\n"
-        
-        # Paginierungs-Knöpfe
-        keyboard_rows = []
+            if sub_action == "all": text += f"*{page*PAGE_SIZE+i+1}.* Aus *{item['chat_title']}* ({dt})\n`{item['message_text'][:100]}...`\n\n"
+            else: text += f"*{page*PAGE_SIZE+i+1}.* Code: `{item['gutschein_code']}`\n_Aus {item['chat_title']} ({dt})_\n\n"
+
         nav_row = []
         if page > 0: nav_row.append(InlineKeyboardButton("◀️", callback_data=f'view_{sub_action}_{page-1}'))
-        if (start_index + PAGE_SIZE) < len(items): nav_row.append(InlineKeyboardButton("▶️", callback_data=f'view_{sub_action}_{page+1}'))
-        if nav_row: keyboard_rows.append(nav_row)
-        keyboard_rows.append([InlineKeyboardButton("🏠 Menü schließen & aufräumen", callback_data='monitor_stop_0')])
+        if (page+1)*PAGE_SIZE < len(item_source): nav_row.append(InlineKeyboardButton("▶️", callback_data=f'view_{sub_action}_{page+1}'))
         
-        menu_msg = await query.effective_chat.send_text(text, reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode='Markdown')
-        context.user_data['control_message_id'] = menu_msg.message_id # Diese Nachricht wird beim Schließen auch gelöscht
+        keyboard = [nav_row] if nav_row else []
+        keyboard.append([InlineKeyboardButton("🏠 Schließen & Aufräumen", callback_data='stop_viewing_0')])
+        
+        msg = await query.effective_chat.send_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        context.user_data['control_message_id'] = msg.message_id
 
+# --- 5. Hauptprogramm ---
 def main() -> None:
-    if not all([BOT_TOKEN, ZIEL_BENUTZER_ID, DATA_CHANNEL_ID]):
-        logger.critical("Essentielle Umgebungsvariablen fehlen!")
-        return
-
-    # Webserver starten
     Thread(target=run_flask, daemon=True).start()
+    logger.info("Flask-Webserver gestartet.")
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.post_init = init_database
 
-    # Handler registrieren
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Nachrichtenhändler in Gruppen: Wichtig, sie in der gleichen Gruppe zu haben
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_monitoring_message), group=1)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keyword_message), group=1)
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_group_join), group=2)
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+    # Ein Handler für alle relevanten Nachrichten in Gruppen
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, group_message_handler))
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, new_group_handler))
 
-    logger.info("Bot startet im erweiterten Modus...")
-    application.run_polling(drop_pending_updates=True) # Verwirft alte Nachrichten bei Neustart
+    logger.info("Telegram Bot startet Polling...")
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
